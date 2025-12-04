@@ -1,0 +1,271 @@
+---
+title: "Untitled"
+author: "Gaurav Law"
+date: "`r Sys.Date()`"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, warning=FALSE, message=FALSE}
+library(tidyverse)
+library(ggplot2)
+library(ggfortify)
+library(pROC)
+library(GGally)
+library(janitor)
+library(broom)
+library(class)
+library(xgboost)
+library(randomForest)
+library(gt)
+library(gtExtras)
+library(caret)
+library(reshape2)
+library(arrow)
+library(survminer)
+library(survival)
+library(lubridate)
+```
+
+
+```{r}
+scores <- read_parquet("~/Downloads/merged_data.parquet") %>%
+  as_tibble() %>%
+  mutate(Delinquency_Status = ifelse(`Current Loan Delinquency Status` == 0, 0, 1))
+```
+
+```{r}
+# Find numeric columns to be used in PCA (only takes numeric)
+num_df <- scores %>% 
+  select(where(is.numeric)) %>%
+  select(where(~ sd(.x, na.rm = TRUE) != 0)) %>%
+  drop_na(`Current Interest Rate`)
+
+# Filter with null counts higher than a million
+num_df <- num_df %>%
+  select(where(~ sum(is.na(.x)) <= 1000000))
+
+# Manual High Null Value Removals
+num_df <- num_df[!names(num_df) %in% c("Mortgage Insurance Percentage",
+                                       "Co-Borrower Credit Score Current",
+                                       "Co-Borrower Credit Score at Issuance",
+                                       "Mortgage Insurance Type",
+                                       "Co-Borrower Credit Score at Origination",
+                                       "Co-Borrower Credit Score At Issuance",
+                                       "Cumulative Credit Event Net Gain or Loss",
+                                       "loan_identifier",
+                                       "vs4_current_method",
+                                       "vs4_bimerge_lowest",
+                                       "vs4_bimerge_highest",
+                                       "vs4_bimerge_median",
+                                       "Borrower Credit Score At Issuance",
+                                       "Borrower Credit Score Current ",
+                                       "Metropolitan Statistical Area (MSA)"
+                                       )] %>%
+  drop_na()
+
+
+
+```
+
+```{r}
+# Compute the correlation matrix
+cor_matrix <- cor(pca_df, use = "complete.obs")
+
+# Melt the correlation matrix into a long format
+cor_melt <- melt(cor_matrix)
+
+# Create a heatmap
+ggplot(cor_melt, aes(x = Var1, y = Var2, fill = value)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient2(low = "blue", high = "red", mid = "white",
+                       midpoint = 0, limit = c(-1, 1), space = "Lab",
+                       name = "Correlation") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1, size = 12),
+        axis.text.y = element_text(size = 12)) +
+  labs(title = "FICO/VS4 Variable Correlation", x = "", y = "")
+```
+
+
+```{r}
+# Multicollinear variables
+num_df <- num_df[!names(num_df) %in% c("Interest Bearing UPB",
+                                       "Current Interest Rate",
+                                       "Interest Rate UPB",
+                                       "Current Actual UPB",
+                                       "UPB at Issuance",
+                                       "Original Combined Loan to Value Ratio (CLTV)",
+                                       "Current Loan Delinquency Status"
+                                       )]
+
+
+                                       
+```
+
+
+
+
+```{r}
+# Run PCA
+pca_df <- num_df %>% select(-Delinquency_Status, -`Loan Identifier`, -`Reference Pool ID`, -`Zip Code Short`)
+pca <- prcomp(pca_df, scale. = TRUE)
+
+# Variance explained
+var_explained <- pca$sdev^2 / sum(pca$sdev^2)
+
+# Show first 15 variance values
+var_explained[1:15]
+
+# Plot first 15 PCs
+library(ggplot2)
+var_df <- data.frame(PC = 1:15, Variance = var_explained[1:15])
+
+ggplot(var_df, aes(PC, Variance)) +
+  geom_line() +
+  geom_point() +
+  theme_minimal()
+
+# Show the first 15 PC score columns
+pca_scores <- as.data.frame(pca$x)
+head(pca_scores[, 1:15])
+
+```
+
+```{r}
+
+# ---------------------------------------------------------
+# 1. Extract loadings and convert to tibble
+# ---------------------------------------------------------
+loadings_df <- pca$rotation %>%
+  as.data.frame() %>%
+  as_tibble(rownames = "variable")
+
+# ---------------------------------------------------------
+# 2. Function to get top N variables for a single PC
+# ---------------------------------------------------------
+get_top_vars <- function(pc_number, top_n = 10) {
+  pc_name <- paste0("PC", pc_number)
+  
+  loadings_df %>%
+    select(variable, all_of(pc_name)) %>%
+    arrange(desc(abs(.data[[pc_name]]))) %>%
+    dplyr::slice(1:top_n)  # Explicitly use dplyr::slice()
+}
+
+# ---------------------------------------------------------
+# 3. Get top 10 variables for PCs 1–15
+# ---------------------------------------------------------
+top_vars_list <- map(1:15, ~ get_top_vars(.x, top_n = 10))
+
+# ---------------------------------------------------------
+# 4. Print results
+# ---------------------------------------------------------
+for (i in 1:15) {
+  cat("\n============================\n")
+  cat("   TOP VARIABLES FOR PC", i, "\n")
+  cat("============================\n")
+  print(top_vars_list[[i]])
+}
+
+# ---------------------------------------------------------
+# 5. Combine into one big table (optional)
+# ---------------------------------------------------------
+top_vars_table <- map_df(
+  1:15,
+  ~ get_top_vars(.x, top_n = 10) %>% mutate(PC = paste0("PC", .x)),
+  .id = "PC_Index"
+)
+top_vars_table
+```
+
+```{r}
+
+num_df <- num_df[!names(num_df) %in% c("Remaining Months to Legal Maturity",
+                                       "Origination Date",
+                                       "Maturity Date",
+                                       "First Payment Date")]
+
+target <- "Delinquency_Status"
+
+exclude_vars <- c("Loan Identifier",
+                  "Reference Pool ID",
+                  "Zip Code Short",
+                  target)
+
+features <- setdiff(names(num_df), exclude_vars)
+
+trainIndex <- sample(1:nrow(num_df), 0.8 * nrow(num_df)) # split on 70% to training
+
+training_data <- num_df[trainIndex, ]
+testing_data <- num_df[-trainIndex, ]
+
+set.seed(123)
+
+dtrain <- xgb.DMatrix(data = as.matrix(training_data[, features]), 
+                      label = training_data[[target]])
+dtest  <- xgb.DMatrix(data = as.matrix(testing_data[, features]), 
+                      label = testing_data[[target]])
+
+# Train the model
+xgb_model <- xgboost(
+  data = dtrain,
+  objective = "reg:logistic",
+  nrounds = 100,
+  eta = 0.1,
+  max_depth = 4,
+  verbose = 0
+)
+
+# Calculate our predictions
+testing_data$Delinquency_Status <- round(predict(xgb_model, newdata = dtest))
+
+# Calculate our FHR predictions
+preds <- predict(xgb_model, newdata = dtest)
+
+# Calculate RMSE
+actuals <- testing_data[[target]]
+
+rmse_xg <- sqrt(mean((preds - actuals)^2))
+rmse_xg
+
+testing_data %>%
+  group_by(Delinquency_Status) %>%
+  distinct() %>%
+  count()
+
+
+```
+
+```{r}
+# Feature importance graph, judged by Information Gain + Gini Impurity (good for CARTs)
+
+importance <- xgb.importance(feature_names = features, model = xgb_model) %>%
+  as_tibble() %>%
+  arrange(-Gain) %>%
+  slice_head(n = 20)
+
+
+importance %>%
+  ggplot(aes(x = reorder(Feature, Gain), y = Gain)) + geom_col(fill = "red") + 
+  coord_flip() + labs(title = "XGB Feature Importance Plot",
+                      x = "",
+                      y = "Relative Importance (Gain)") +
+  theme_minimal()
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
