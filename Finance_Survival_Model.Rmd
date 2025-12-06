@@ -8,7 +8,7 @@ output:
 ---
 
 ```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
 ```
 
 # Executive Summary
@@ -40,7 +40,7 @@ library(Hmisc)  # For C-index calculation
 # Data Loading and Survival Preparation
 
 ```{r load_data}
-scores <- read_parquet("data/merged_data.parquet") %>%
+scores <- read_parquet("~/Downloads/merged_data.parquet") %>%
   as_tibble() %>%
   mutate(
     # Duration: time at risk (Loan Age in months)
@@ -104,6 +104,33 @@ high_null_vars <- c(
 
 num_df <- num_df[!names(num_df) %in% high_null_vars] %>%
   drop_na()
+```
+
+
+```{r correlation plots + further FE, fig.cap = "FICO/VS4 Correlation Plot"}
+
+pca_df <- num_df %>% select(-c(`Reference Pool ID`,
+                               `Loan Identifier`,
+                               Delinquency_Status,
+                               `Zip Code Short`
+                               ))
+
+# Compute the correlation matrix
+cor_matrix <- cor(pca_df, use = "complete.obs")
+
+# Melt the correlation matrix into a long format
+cor_melt <- melt(cor_matrix)
+
+# Create a heatmap
+ggplot(cor_melt, aes(x = Var1, y = Var2, fill = value)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient2(low = "blue", high = "red", mid = "white",
+                       midpoint = 0, limit = c(-1, 1), space = "Lab",
+                       name = "Correlation") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1, size = 12),
+        axis.text.y = element_text(size = 12)) +
+  labs(title = "FICO/VS4 Variable Correlation", x = "", y = "")
 
 # Remove multicollinear variables
 multicollinear_vars <- c(
@@ -117,6 +144,57 @@ multicollinear_vars <- c(
 )
 
 num_df <- num_df[!names(num_df) %in% multicollinear_vars]
+
+```
+
+```{r pca + dim reduction, fig.cap = "Principle Component Analysis on Fannie Mae Data"}
+# Run PCA
+pca <- prcomp(pca_df, scale. = TRUE)
+
+# Variance explained
+var_explained <- pca$sdev^2 / sum(pca$sdev^2)
+
+# Show first 15 variance values
+#var_explained[1:15]
+
+# Plot first 15 PCs
+library(ggplot2)
+var_df <- data.frame(PC = 1:15, Variance = var_explained[1:15])
+
+ggplot(var_df, aes(PC, Variance)) +
+  geom_line() +
+  geom_point() +
+  theme_minimal()
+
+# Show the first 15 PC score columns
+pca_scores <- as.data.frame(pca$x)
+head(pca_scores[, 1:4])
+
+```
+
+```{r}
+loadings_df <- pca$rotation %>%
+  as.data.frame() %>%
+  as_tibble(rownames = "variable")
+
+# Begin Principal Component Analysis
+# Function to get top n variables for single PC
+get_top_vars <- function(pc_number, top_n = 10) {
+  pc_name <- paste0("PC", pc_number)
+  
+  loadings_df %>%
+    select(variable, all_of(pc_name)) %>%
+    arrange(desc(abs(.data[[pc_name]]))) %>%
+    dplyr::slice(1:top_n)
+}
+
+top_vars_list <- map(1:15, ~ get_top_vars(.x, top_n = 10))
+
+c(top_vars_list[1:2])
+```
+
+
+```{r}
 
 # Remove time-redundant variables
 time_redundant_vars <- c(
@@ -159,6 +237,7 @@ num_df <- num_df %>%
 
 cat("Final feature count:", ncol(num_df) - 5, "\n")
 ```
+
 
 # Train/Test Split
 
@@ -207,7 +286,6 @@ cox_formula <- as.formula(paste("Surv(duration, event) ~",
                                 paste(features_clean, collapse = " + ")))
 
 # Fit Cox model
-cat("Fitting baseline Cox model...\n")
 cox_model <- coxph(
   cox_formula,
   data = train_data,
@@ -216,9 +294,7 @@ cox_model <- coxph(
 
 # Extract key metrics
 cox_concordance <- summary(cox_model)$concordance[1]
-cat("\n===========================================\n")
 cat("Cox Model C-index (Training):", round(cox_concordance, 4), "\n")
-cat("===========================================\n")
 ```
 
 # Model 1: Cox Model Evaluation on Test Set
@@ -232,10 +308,8 @@ test_data$cox_lp <- predict(cox_model, newdata = test_data, type = "lp")
 cox_test_cindex_val <- rcorr.cens(-test_data$cox_lp, 
                                   Surv(test_data$duration, test_data$event))
 
-cat("\n===========================================\n")
 cat("Cox Model C-index (Test):", round(cox_test_cindex_val["C Index"], 4), "\n")
 cat("Standard Error:", round(cox_test_cindex_val["S.D."]/2, 4), "\n")
-cat("===========================================\n")
 
 # Store for later
 cox_test_cindex <- list(
@@ -246,7 +320,7 @@ cox_test_cindex <- list(
 
 # Model 1: Cox Feature Importance
 
-```{r cox_importance, fig.height=8, fig.width=10}
+```{r cox_importance, fig.height=8, fig.width=10, fig.cap = "Cox Model Feature Importance PLot"}
 # Extract coefficients and significance
 cox_coefs <- broom::tidy(cox_model) %>%
   mutate(
@@ -283,7 +357,7 @@ cox_coefs %>%
 
 # Model 2: XGBoost on Cox Residuals
 
-```{r xgboost_residuals}
+```{r xgboost_residuals, fig.cap = "XGBoost Model Feature Importance"}
 # Calculate Cox residuals
 train_data$cox_deviance <- residuals(cox_model, type = "deviance")
 
@@ -332,11 +406,13 @@ xgb_residual_model <- xgboost(
   params = xgb_params,
   data = dtrain,
   nrounds = 200,
-  verbose = 1
+  verbose = 1,
+  print_every_n = 50
 )
 
 # Predict
 test_data$xgb_residual_pred <- predict(xgb_residual_model, dtest)
+
 ```
 
 # Model 2: XGBoost Feature Importance
@@ -371,10 +447,8 @@ test_data$hybrid_risk_score <- test_data$cox_lp + test_data$xgb_residual_pred
 hybrid_cindex_val <- rcorr.cens(-test_data$hybrid_risk_score, 
                                 Surv(test_data$duration, test_data$event))
 
-cat("\n===========================================\n")
 cat("HYBRID Model C-index (Test):", round(hybrid_cindex_val["C Index"], 4), "\n")
 cat("Standard Error:", round(hybrid_cindex_val["S.D."]/2, 4), "\n")
-cat("===========================================\n")
 
 hybrid_cindex <- list(
   c.index = as.numeric(hybrid_cindex_val["C Index"]),
@@ -418,7 +492,7 @@ print(comparison_df)
 
 # Visualizations
 
-```{r prediction_viz, fig.height=8, fig.width=10}
+```{r prediction_viz, fig.height=8, fig.width=10, fig.cap = "Hybride Model Survival Curves"}
 # Create risk quartiles
 test_data <- test_data %>%
   mutate(
@@ -451,7 +525,7 @@ ggsurvplot(
 
 # Risk Group Analysis
 
-```{r risk_group_analysis}
+```{r risk_group_analysis, fig.cap = "Predicted vs. Actual Delinquency Rates"}
 risk_analysis <- test_data %>%
   group_by(hybrid_risk_group) %>%
   summarise(
@@ -498,7 +572,7 @@ risk_analysis %>%
 
 # Calibration
 
-```{r calibration}
+```{r calibration, fig.cap = "Model Calibration vs. Risk Decile"}
 test_data <- test_data %>%
   mutate(risk_decile = ntile(hybrid_risk_score, 10))
 
@@ -528,7 +602,6 @@ print(calibration_df)
 # Summary
 
 ```{r summary}
-cat("\n=======================================================\n")
 cat("         POINT-IN-TIME MODEL SUMMARY                   \n")
 cat("=======================================================\n")
 cat("Model Type: Portfolio Risk Management (October 2025)\n")
