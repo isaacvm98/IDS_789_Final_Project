@@ -1,0 +1,583 @@
+---
+title: "Point-in-Time Survival Model for Mortgage Portfolio Risk Management"
+author: "Gaurav Law & Isaac Vergara"
+date: "`r Sys.Date()`"
+output:
+  word_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# Executive Summary
+
+This analysis builds a **point-in-time survival model** for predicting mortgage delinquency in an existing loan portfolio. The model uses current loan characteristics as of October 2025 to predict future default risk.
+
+**Use Case:** Portfolio risk management - "Given what we know about loans today, which are most likely to default in the coming months?"
+
+```{r libraries}
+library(tidyverse)
+library(ggplot2)
+library(ggfortify)
+library(pROC)
+library(GGally)
+library(janitor)
+library(broom)
+library(xgboost)
+library(gt)
+library(gtExtras)
+library(caret)
+library(reshape2)
+library(arrow)
+library(survminer)
+library(survival)
+library(lubridate)
+library(Hmisc)  # For C-index calculation
+```
+
+# Data Loading and Survival Preparation
+
+```{r load_data}
+scores <- read_parquet("data/merged_data.parquet") %>%
+  as_tibble() %>%
+  mutate(
+    # Duration: time at risk (Loan Age in months)
+    duration = `Loan Age`,
+    
+    # Event: 1 = seriously delinquent (90+ days), 0 = censored
+    event = case_when(
+      as.numeric(`Current Loan Delinquency Status`) >= 3 ~ 1,
+      `Zero Balance Code` %in% c('01') ~ 0,
+      TRUE ~ 0
+    ),
+    
+    Delinquency_Status = ifelse(`Current Loan Delinquency Status` == 0, 0, 1)
+  ) %>%
+  filter(!`Zero Balance Code` %in% c('02', '03', '09')) %>%
+  filter(duration > 0)
+
+cat("Portfolio Snapshot (October 2025)\n")
+cat("Total loans:", nrow(scores), "\n")
+cat("Events (delinquent 90+ days):", sum(scores$event), "\n")
+cat("Event rate:", round(mean(scores$event) * 100, 2), "%\n\n")
+```
+
+# Feature Engineering
+
+```{r feature_engineering}
+# Find numeric columns - first pass
+num_df <- scores %>% 
+  select(where(is.numeric))
+
+# Remove constant columns (sd = 0 or all NA)
+num_df <- num_df %>%
+  select(where(function(x) {
+    sd_val <- sd(x, na.rm = TRUE)
+    !is.na(sd_val) && sd_val != 0
+  })) %>%
+  drop_na('Current Interest Rate')
+
+# Filter columns with excessive missing values
+num_df <- num_df %>%
+  select(where(~ sum(is.na(.x)) <= 1000000))
+
+# Manual high null value removals
+high_null_vars <- c(
+  "Mortgage Insurance Percentage",
+  "Co-Borrower Credit Score Current",
+  "Co-Borrower Credit Score at Issuance",
+  "Mortgage Insurance Type",
+  "Co-Borrower Credit Score at Origination",
+  "Co-Borrower Credit Score At Issuance",
+  "Cumulative Credit Event Net Gain or Loss",
+  "loan_identifier",
+  "vs4_current_method",
+  "vs4_bimerge_lowest",
+  "vs4_bimerge_highest",
+  "vs4_bimerge_median",
+  "Borrower Credit Score At Issuance",
+  "Borrower Credit Score Current ",
+  "Metropolitan Statistical Area (MSA)"
+)
+
+num_df <- num_df[!names(num_df) %in% high_null_vars] %>%
+  drop_na()
+
+# Remove multicollinear variables
+multicollinear_vars <- c(
+  "Interest Bearing UPB",
+  "Current Interest Rate",
+  "Interest Rate UPB",
+  "Current Actual UPB",
+  "UPB at Issuance",
+  "Original Combined Loan to Value Ratio (CLTV)",
+  "Current Loan Delinquency Status"
+)
+
+num_df <- num_df[!names(num_df) %in% multicollinear_vars]
+
+# Remove time-redundant variables
+time_redundant_vars <- c(
+  "Remaining Months to Legal Maturity",
+  "Origination Date",
+  "Maturity Date",
+  "First Payment Date"
+)
+
+num_df <- num_df[!names(num_df) %in% time_redundant_vars]
+
+# Add survival variables back
+num_df <- num_df %>%
+  mutate(
+    duration = scores$duration[match(num_df$`Loan Identifier`, scores$`Loan Identifier`)],
+    event = scores$event[match(num_df$`Loan Identifier`, scores$`Loan Identifier`)],
+    Delinquency_Status = scores$Delinquency_Status[match(num_df$`Loan Identifier`, scores$`Loan Identifier`)]
+  )
+
+# Add categorical features
+categorical_data <- scores %>%
+  select('Loan Identifier',
+          'Property Type',
+         'Occupancy Status',
+         'Amortization Type',
+         'Modification Flag',
+         'Interest Only Loan Indicator')
+
+num_df <- num_df %>%
+  left_join(categorical_data, by = "Loan Identifier") %>%
+  mutate(
+    # Create dummy variables
+    is_cashout_refi = ifelse('Loan Purpose' == 'C', 1, 0),
+    is_investor = ifelse('Occupancy Status' == 'I', 1, 0),
+    is_condo = ifelse('Property Type' == 'CO', 1, 0),
+    is_arm = ifelse('Amortization Type' == 'ARM', 1, 0),
+    has_modification = ifelse('Modification Flag' == 'Y', 1, 0),
+    is_interest_only = ifelse('Interest Only Loan Indicator' == 'Y', 1, 0)
+  )
+
+cat("Final feature count:", ncol(num_df) - 5, "\n")
+```
+
+# Train/Test Split
+
+```{r split}
+set.seed(123)
+
+# Define features (exclude identifiers and targets)
+exclude_vars <- c(
+  "Loan Identifier",
+  "Reference Pool ID",
+  "Zip Code Short",
+  "duration",
+  "event",
+  "Delinquency_Status",
+  # Exclude the raw categorical variables (we have dummies)
+  "Loan Purpose",
+  "Property Type",
+  "Occupancy Status",
+  "Amortization Type",
+  "Modification Flag",
+  "Interest Only Loan Indicator"
+)
+
+features <- setdiff(names(num_df), exclude_vars)
+
+# Split
+trainIndex <- sample(1:nrow(num_df), 0.8 * nrow(num_df))
+train_data <- num_df[trainIndex, ]
+test_data <- num_df[-trainIndex, ]
+
+cat("Training set:", nrow(train_data), "loans\n")
+cat("Test set:", nrow(test_data), "loans\n")
+cat("Training event rate:", round(mean(train_data$event) * 100, 2), "%\n")
+cat("Test event rate:", round(mean(test_data$event) * 100, 2), "%\n")
+cat("Features used:", length(features), "\n\n")
+```
+
+# Model 1: Baseline Cox Proportional Hazards
+
+```{r cox_baseline}
+# Clean feature names by wrapping them in backticks
+features_clean <- paste0("`", features, "`")
+
+# Create formula with backticked names
+cox_formula <- as.formula(paste("Surv(duration, event) ~", 
+                                paste(features_clean, collapse = " + ")))
+
+# Fit Cox model
+cat("Fitting baseline Cox model...\n")
+cox_model <- coxph(
+  cox_formula,
+  data = train_data,
+  model = TRUE
+)
+
+# Extract key metrics
+cox_concordance <- summary(cox_model)$concordance[1]
+cat("\n===========================================\n")
+cat("Cox Model C-index (Training):", round(cox_concordance, 4), "\n")
+cat("===========================================\n")
+```
+
+# Model 1: Cox Model Evaluation on Test Set
+
+```{r cox_evaluation}
+# Predict on test set
+test_data$cox_risk_score <- predict(cox_model, newdata = test_data, type = "risk")
+test_data$cox_lp <- predict(cox_model, newdata = test_data, type = "lp")
+
+# Calculate C-index using Harrell's concordance
+cox_test_cindex_val <- rcorr.cens(-test_data$cox_lp, 
+                                  Surv(test_data$duration, test_data$event))
+
+cat("\n===========================================\n")
+cat("Cox Model C-index (Test):", round(cox_test_cindex_val["C Index"], 4), "\n")
+cat("Standard Error:", round(cox_test_cindex_val["S.D."]/2, 4), "\n")
+cat("===========================================\n")
+
+# Store for later
+cox_test_cindex <- list(
+  c.index = as.numeric(cox_test_cindex_val["C Index"]),
+  se = as.numeric(cox_test_cindex_val["S.D."]/2)
+)
+```
+
+# Model 1: Cox Feature Importance
+
+```{r cox_importance, fig.height=8, fig.width=10}
+# Extract coefficients and significance
+cox_coefs <- broom::tidy(cox_model) %>%
+  mutate(
+    abs_estimate = abs(estimate),
+    significance = case_when(
+      p.value < 0.001 ~ "***",
+      p.value < 0.01 ~ "**",
+      p.value < 0.05 ~ "*",
+      TRUE ~ ""
+    ),
+    direction = ifelse(estimate > 0, "Increases Risk", "Decreases Risk")
+  ) %>%
+  arrange(desc(abs_estimate)) %>%
+  slice_head(n = 20)
+
+# Plot top 20 coefficients
+cox_coefs %>%
+  ggplot(aes(x = reorder(term, abs_estimate), y = estimate, 
+             fill = direction)) +
+  geom_col() +
+  coord_flip() +
+  scale_fill_manual(values = c("Increases Risk" = "coral", 
+                               "Decreases Risk" = "steelblue")) +
+  labs(
+    title = "Cox Model: Top 20 Features by Coefficient Magnitude",
+    subtitle = "Point-in-Time Model - Portfolio Risk Management",
+    x = "",
+    y = "Log Hazard Ratio",
+    fill = ""
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+# Model 2: XGBoost on Cox Residuals
+
+```{r xgboost_residuals}
+# Calculate Cox residuals
+train_data$cox_deviance <- residuals(cox_model, type = "deviance")
+
+# Clean the data
+train_clean <- train_data %>%
+  filter(is.finite(cox_deviance)) %>%
+  filter(!is.na(cox_deviance))
+
+cat("Training samples:", nrow(train_clean), "\n\n")
+
+dtrain <- xgb.DMatrix(
+  data = as.matrix(train_clean[, features]), 
+  label = train_clean$cox_deviance
+)
+
+dtest <- xgb.DMatrix(
+  data = as.matrix(test_data[, features])
+)
+
+# XGBoost parameters
+xgb_params <- list(
+  objective = "reg:squarederror",
+  eta = 0.05,
+  max_depth = 6,
+  subsample = 0.8,
+  colsample_bytree = 0.8,
+  min_child_weight = 5,
+  gamma = 0.1
+)
+
+# Cross-validation
+# cv_result <- xgb.cv(
+#   params = xgb_params,
+#   data = dtrain,
+#   nrounds = 200,
+#   nfold = 5,
+#   early_stopping_rounds = 10,
+#   verbose = 0
+# )
+
+# optimal_rounds <- cv_result$best_iteration
+# cat("Optimal rounds:", optimal_rounds, "\n\n")
+
+# Train final model
+xgb_residual_model <- xgboost(
+  params = xgb_params,
+  data = dtrain,
+  nrounds = 200,
+  verbose = 1
+)
+
+# Predict
+test_data$xgb_residual_pred <- predict(xgb_residual_model, dtest)
+```
+
+# Model 2: XGBoost Feature Importance
+
+```{r xgb_importance, fig.height=8, fig.width=10}
+importance_xgb <- xgb.importance(feature_names = features, 
+                                 model = xgb_residual_model) %>%
+  as_tibble() %>%
+  arrange(-Gain) %>%
+  slice_head(n = 20)
+
+importance_xgb %>%
+  ggplot(aes(x = reorder(Feature, Gain), y = Gain)) + 
+  geom_col(fill = "coral") + 
+  coord_flip() + 
+  labs(
+    title = "XGBoost: Feature Importance",
+    subtitle = "Captures non-linear patterns missed by Cox",
+    x = "",
+    y = "Relative Importance (Gain)"
+  ) +
+  theme_minimal()
+```
+
+# Model 3: Hybrid Model
+
+```{r hybrid_model}
+# Combine Cox + XGBoost
+test_data$hybrid_risk_score <- test_data$cox_lp + test_data$xgb_residual_pred
+
+# Calculate C-index
+hybrid_cindex_val <- rcorr.cens(-test_data$hybrid_risk_score, 
+                                Surv(test_data$duration, test_data$event))
+
+cat("\n===========================================\n")
+cat("HYBRID Model C-index (Test):", round(hybrid_cindex_val["C Index"], 4), "\n")
+cat("Standard Error:", round(hybrid_cindex_val["S.D."]/2, 4), "\n")
+cat("===========================================\n")
+
+hybrid_cindex <- list(
+  c.index = as.numeric(hybrid_cindex_val["C Index"]),
+  se = as.numeric(hybrid_cindex_val["S.D."]/2)
+)
+```
+
+# Model Comparison
+
+```{r model_comparison}
+comparison_df <- tibble(
+  Model = c("Cox Baseline", "Hybrid (Cox + XGBoost)"),
+  C_Index = c(cox_test_cindex$c.index, hybrid_cindex$c.index),
+  SE = c(cox_test_cindex$se, hybrid_cindex$se)
+) %>%
+  mutate(
+    CI_Lower = C_Index - 1.96 * SE,
+    CI_Upper = C_Index + 1.96 * SE,
+    Improvement = C_Index - first(C_Index),
+    Improvement_Pct = (Improvement / first(C_Index)) * 100
+  )
+
+comparison_df %>%
+  gt() %>%
+  fmt_number(columns = c(C_Index, SE, CI_Lower, CI_Upper), decimals = 4) %>%
+  fmt_number(columns = c(Improvement, Improvement_Pct), decimals = 2) %>%
+  tab_header(
+    title = "Point-in-Time Survival Model Performance",
+    subtitle = "C-index on Test Set"
+  ) %>%
+  tab_style(
+    style = cell_fill(color = "lightgreen"),
+    locations = cells_body(
+      columns = C_Index,
+      rows = C_Index == max(C_Index)
+    )
+  )
+
+print(comparison_df)
+```
+
+# Visualizations
+
+```{r prediction_viz, fig.height=8, fig.width=10}
+# Create risk quartiles
+test_data <- test_data %>%
+  mutate(
+    cox_risk_group = cut(cox_lp, 
+                         breaks = quantile(cox_lp, probs = 0:4/4),
+                         labels = c("Low", "Medium-Low", "Medium-High", "High"),
+                         include.lowest = TRUE),
+    hybrid_risk_group = cut(hybrid_risk_score,
+                           breaks = quantile(hybrid_risk_score, probs = 0:4/4),
+                           labels = c("Low", "Medium-Low", "Medium-High", "High"),
+                           include.lowest = TRUE)
+  )
+
+# Survival curves
+fit_hybrid <- survfit(Surv(duration, event) ~ hybrid_risk_group, data = test_data)
+
+ggsurvplot(
+  fit_hybrid,
+  data = test_data,
+  pval = TRUE,
+  conf.int = TRUE,
+  risk.table = TRUE,
+  title = "Survival Curves by Hybrid Risk Group",
+  xlab = "Months Since Origination",
+  ylab = "Probability of No Delinquency",
+  legend.title = "Risk Group",
+  palette = c("green", "yellow", "orange", "red")
+)
+```
+
+# Risk Group Analysis
+
+```{r risk_group_analysis}
+risk_analysis <- test_data %>%
+  group_by(hybrid_risk_group) %>%
+  summarise(
+    n_loans = n(),
+    n_events = sum(event),
+    event_rate = mean(event) * 100,
+    median_duration = median(duration),
+    mean_risk_score = mean(hybrid_risk_score)
+  ) %>%
+  arrange(desc(mean_risk_score))
+
+risk_analysis %>%
+  gt() %>%
+  fmt_number(columns = c(event_rate, median_duration, mean_risk_score), decimals = 2) %>%
+  tab_header(
+    title = "Event Rates by Hybrid Risk Group"
+  )
+
+print(risk_analysis)
+
+# Calculate risk separation
+low_risk_rate <- risk_analysis %>% filter(hybrid_risk_group == "Low") %>% pull(event_rate)
+high_risk_rate <- risk_analysis %>% filter(hybrid_risk_group == "High") %>% pull(event_rate)
+
+cat("\nRisk Separation:\n")
+cat("Low Risk:", round(low_risk_rate, 2), "%\n")
+cat("High Risk:", round(high_risk_rate, 2), "%\n")
+cat("Relative Risk:", round(high_risk_rate / low_risk_rate, 2), "x\n")
+
+# Plot
+risk_analysis %>%
+  ggplot(aes(x = hybrid_risk_group, y = event_rate, fill = hybrid_risk_group)) +
+  geom_col() +
+  geom_text(aes(label = paste0(round(event_rate, 2), "%")), vjust = -0.5) +
+  scale_fill_manual(values = c("green", "yellow", "orange", "red")) +
+  labs(
+    title = "Actual Delinquency Rates by Predicted Risk Group",
+    x = "Risk Group",
+    y = "Event Rate (%)"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+# Calibration
+
+```{r calibration}
+test_data <- test_data %>%
+  mutate(risk_decile = ntile(hybrid_risk_score, 10))
+
+calibration_df <- test_data %>%
+  group_by(risk_decile) %>%
+  summarise(
+    n = n(),
+    n_events = sum(event),
+    actual_rate = mean(event) * 100
+  )
+
+calibration_df %>%
+  ggplot(aes(x = risk_decile, y = actual_rate)) +
+  geom_line(color = "steelblue", size = 1.2) +
+  geom_point(color = "coral", size = 3) +
+  scale_x_continuous(breaks = 1:10) +
+  labs(
+    title = "Model Calibration by Risk Decile",
+    x = "Risk Decile (1 = Lowest, 10 = Highest)",
+    y = "Actual Event Rate (%)"
+  ) +
+  theme_minimal()
+
+print(calibration_df)
+```
+
+# Summary
+
+```{r summary}
+cat("\n=======================================================\n")
+cat("         POINT-IN-TIME MODEL SUMMARY                   \n")
+cat("=======================================================\n")
+cat("Model Type: Portfolio Risk Management (October 2025)\n")
+cat("\nDataset:\n")
+cat("  Test set:", nrow(test_data), "loans\n")
+cat("  Events:", sum(test_data$event), "\n")
+cat("  Event rate:", round(mean(test_data$event) * 100, 2), "%\n")
+cat("\nPerformance:\n")
+cat("  Cox C-index:", round(cox_test_cindex$c.index, 4), "\n")
+cat("  Hybrid C-index:", round(hybrid_cindex$c.index, 4), "\n")
+cat("  Improvement:", round((hybrid_cindex$c.index - cox_test_cindex$c.index) / 
+                            cox_test_cindex$c.index * 100, 2), "%\n")
+cat("\nRisk Separation:\n")
+cat("  Relative Risk (High/Low):", round(high_risk_rate / low_risk_rate, 2), "x\n")
+cat("\nUse Case: Portfolio monitoring and loss forecasting\n")
+cat("=======================================================\n")
+```
+```{r}
+precision_analysis <- test_data %>%
+     group_by(hybrid_risk_group) %>%
+     summarise(
+         n = n(),
+         n_events = sum(event),
+         precision = mean(event) * 100
+     )
+print(precision_analysis)
+```
+```{r}
+# For each age, what % have defaulted by that point?
+cumulative_default <- test_data %>%
+  arrange(`Loan Age`) %>%
+  group_by(hybrid_risk_group) %>%
+  mutate(
+    cumulative_events = cumsum(event),
+    cumulative_rate = cumulative_events / n() * 100
+  ) %>%
+  ungroup()
+
+# Plot
+ggplot(cumulative_default, aes(x = `Loan Age`, y = cumulative_rate, 
+                               color = hybrid_risk_group)) +
+  geom_smooth(se = FALSE, size = 1.2) +
+  scale_color_manual(values = c("green", "yellow", "orange", "red")) +
+  labs(
+    title = "Cumulative Default Rate by Loan Age",
+    x = "Loan Age (Months)",
+    y = "Cumulative % Defaulted",
+    color = "Risk Group"
+  ) +
+  theme_minimal()
+```
+
