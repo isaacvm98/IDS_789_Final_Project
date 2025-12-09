@@ -1,0 +1,983 @@
+---
+title: 'Beyond FICO: Credit Score Performance and Enhanced Modeling for Mortgage Risk'
+author: "Gaurav Law & Isaac Vergara"
+date: "`r Sys.Date()`"
+output:
+  word_document:
+    toc: true
+    toc_depth: '3'
+  pdf_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE, 
+                      fig.width = 10, fig.height = 6)
+```
+
+\newpage
+
+# Executive Summary
+
+This analysis evaluates credit scoring approaches for mortgage default prediction using a portfolio of 220,664 prime mortgages observed as of October 2025. We address four research questions:
+
+1. **FICO vs VantageScore 4.0 performance**: VS4 provides marginal improvement (ΔC-index = +0.006)
+2. **Treatment of marginal borrowers**: Scores disagree on 3.4% of portfolio; VS4 demonstrates superior accuracy in disagreement zones
+3. **Enhanced model performance**: Behavioral features yield 36% improvement over credit scores alone (C-index 0.997 vs 0.732)
+4. **Implications**: Enhanced models enable strategic portfolio rebalancing—expanding access to 1,264 creditworthy borrowers while avoiding 32 defaults
+
+---
+
+# Setup and Data Preparation
+
+```{r libraries}
+# Core packages
+library(tidyverse)
+library(survival)
+library(Hmisc)
+library(broom)
+library(xgboost)
+library(gt)
+library(gtExtras)
+library(arrow)
+library(survminer)
+library(pROC)
+library(scales)
+
+# Set theme
+theme_set(theme_minimal())
+```
+
+```{r load_data}
+# Load data
+scores <- read_parquet("data/merged_data.parquet") %>%
+  as_tibble() %>%
+  mutate(
+    # Survival variables
+    duration = `Loan Age`,
+    event = case_when(
+      as.numeric(`Current Loan Delinquency Status`) >= 3 ~ 1,
+      `Zero Balance Code` %in% c('01') ~ 0,
+      TRUE ~ 0
+    )
+  ) %>%
+  filter(!`Zero Balance Code` %in% c('02', '03', '09')) %>%
+  filter(duration > 0)
+
+cat("Portfolio Snapshot (October 2025)\n")
+cat("Total loans:", nrow(scores), "\n")
+cat("Events (90+ days delinquent):", sum(scores$event), "\n")
+cat("Event rate:", round(mean(scores$event) * 100, 2), "%\n")
+```
+
+```{r feature_engineering}
+num_df <- scores %>% 
+  select(where(is.numeric))
+
+# Remove constant columns (sd = 0 or all NA)
+num_df <- num_df %>%
+  select(where(function(x) {
+    sd_val <- sd(x, na.rm = TRUE)
+    !is.na(sd_val) && sd_val != 0
+  })) %>%
+  drop_na('Current Interest Rate')
+
+# Filter columns with excessive missing values
+num_df <- num_df %>%
+  select(where(~ sum(is.na(.x)) <= 1000000))
+
+# Manual high null value removals
+high_null_vars <- c(
+  "Mortgage Insurance Percentage",
+  "Co-Borrower Credit Score Current",
+  "Co-Borrower Credit Score at Issuance",
+  "Mortgage Insurance Type",
+  "Co-Borrower Credit Score at Origination",
+  "Co-Borrower Credit Score At Issuance",
+  "Cumulative Credit Event Net Gain or Loss",
+  "loan_identifier",
+  "vs4_current_method",
+  "vs4_bimerge_lowest",
+  "vs4_bimerge_highest",
+  "vs4_bimerge_median",
+  "Borrower Credit Score At Issuance",
+  #"Borrower Credit Score Current ",
+  "Metropolitan Statistical Area (MSA)"
+)
+
+num_df <- num_df[!names(num_df) %in% high_null_vars] %>%
+  drop_na()
+
+# Remove multicollinear variables
+multicollinear_vars <- c(
+  "Interest Bearing UPB",
+  "Current Interest Rate",
+  "Interest Rate UPB",
+  "Current Actual UPB",
+  "UPB at Issuance",
+  "Original Combined Loan to Value Ratio (CLTV)",
+  "Current Loan Delinquency Status"
+)
+
+num_df <- num_df[!names(num_df) %in% multicollinear_vars]
+
+# Remove time-redundant variables
+time_redundant_vars <- c(
+  "Remaining Months to Legal Maturity",
+  "Origination Date",
+  "Maturity Date",
+  "First Payment Date"
+)
+
+num_df <- num_df[!names(num_df) %in% time_redundant_vars]
+
+# Add survival variables back
+num_df <- num_df %>%
+  mutate(
+    duration = scores$duration[match(num_df$`Loan Identifier`, scores$`Loan Identifier`)],
+    event = scores$event[match(num_df$`Loan Identifier`, scores$`Loan Identifier`)],
+    Delinquency_Status = scores$Delinquency_Status[match(num_df$`Loan Identifier`, scores$`Loan Identifier`)]
+  )
+
+# Add categorical features
+categorical_data <- scores %>%
+  select('Loan Identifier',
+          'Property Type',
+         'Occupancy Status',
+         'Amortization Type',
+         'Modification Flag',
+         'Interest Only Loan Indicator')
+
+num_df <- num_df %>%
+  left_join(categorical_data, by = "Loan Identifier") %>%
+  mutate(
+    # Create dummy variables
+    is_cashout_refi = ifelse('Loan Purpose' == 'C', 1, 0),
+    is_investor = ifelse('Occupancy Status' == 'I', 1, 0),
+    is_condo = ifelse('Property Type' == 'CO', 1, 0),
+    is_arm = ifelse('Amortization Type' == 'ARM', 1, 0),
+    has_modification = ifelse('Modification Flag' == 'Y', 1, 0),
+    is_interest_only = ifelse('Interest Only Loan Indicator' == 'Y', 1, 0)
+  )
+
+cat("Final feature count:", ncol(num_df) - 5, "\n")
+```
+
+```{r train_test_split}
+# 80/20 split
+set.seed(123)
+trainIndex <- sample(1:nrow(num_df), 0.8 * nrow(num_df))
+train_data <- num_df[trainIndex, ]
+test_data <- num_df[-trainIndex, ]
+
+cat("Training set:", nrow(train_data), "loans,", sum(train_data$event), "events\n")
+cat("Test set:", nrow(test_data), "loans,", sum(test_data$event), "events\n")
+```
+
+\newpage
+
+# Research Question 1: FICO vs VantageScore 4.0 Performance
+
+*How do FICO and VantageScore 4.0 compare in terms of predictive performance for mortgage credit risk?*
+
+## Univariate Cox Models
+
+We first evaluate FICO and VantageScore 4.0 as standalone predictors. Both scores are measured at loan origination to ensure fair comparison.
+
+```{r rq1_univariate_models}
+# FICO-only model (origination)
+fico_orig_model <- coxph(
+  Surv(duration, event) ~ `Borrower Credit Score at Origination`,
+  data = train_data
+)
+
+# VS4-only model (origination)
+vs4_orig_model <- coxph(
+  Surv(duration, event) ~ vs4_trimerge,
+  data = train_data
+)
+
+# Combined model
+both_scores_model <- coxph(
+  Surv(duration, event) ~ `Borrower Credit Score at Origination` + vs4_trimerge,
+  data = train_data
+)
+
+# Evaluate on test set
+fico_orig_cindex <- rcorr.cens(
+  -predict(fico_orig_model, test_data),
+  Surv(test_data$duration, test_data$event)
+)
+
+vs4_orig_cindex <- rcorr.cens(
+  -predict(vs4_orig_model, test_data),
+  Surv(test_data$duration, test_data$event)
+)
+
+both_cindex <- rcorr.cens(
+  -predict(both_scores_model, test_data),
+  Surv(test_data$duration, test_data$event)
+)
+
+# Create comparison table
+rq1_table <- tibble(
+  Model = c("FICO Score (Origination)", "VantageScore 4.0 (Origination)", "Both Scores Combined"),
+  `C-Index` = c(
+    fico_orig_cindex["C Index"],
+    vs4_orig_cindex["C Index"],
+    both_cindex["C Index"]
+  ),
+  SE = c(
+    fico_orig_cindex["S.D."]/2,
+    vs4_orig_cindex["S.D."]/2,
+    both_cindex["S.D."]/2
+  )
+) %>%
+  mutate(
+    CI_Lower = `C-Index` - 1.96 * SE,
+    CI_Upper = `C-Index` + 1.96 * SE,
+    `Improvement vs FICO` = (`C-Index` - first(`C-Index`)) / first(`C-Index`) * 100
+  )
+
+rq1_table %>%
+  gt() %>%
+  fmt_number(columns = c(`C-Index`, SE, CI_Lower, CI_Upper), decimals = 4) %>%
+  fmt_number(columns = `Improvement vs FICO`, decimals = 2) %>%
+  tab_header(
+    title = "Table 1: Credit Score Discrimination Performance",
+    subtitle = "Both scores measured at loan origination"
+  ) %>%
+  tab_style(
+    style = cell_fill(color = "lightgreen"),
+    locations = cells_body(
+      columns = `C-Index`,
+      rows = `C-Index` == max(`C-Index`)
+    )
+  )
+```
+
+**Key Finding:** VantageScore 4.0 provides marginal improvement over FICO (ΔC-index = `r round(vs4_orig_cindex["C Index"] - fico_orig_cindex["C Index"], 4)`), suggesting modest additional predictive value. Combined, the scores achieve C-index of `r round(both_cindex["C Index"], 4)`, indicating some complementary information but substantial overlap.
+
+## Value of Current FICO Scores
+
+Our dataset includes updated FICO scores as of October 2025, but only origination VS4 scores. We assess the value of score updates.
+
+```{r rq1_current_fico}
+# Current FICO model
+fico_current_model <- coxph(
+  Surv(duration, event) ~ `Borrower Credit Score Current `,
+  data = train_data
+)
+
+fico_current_cindex <- rcorr.cens(
+  -predict(fico_current_model, test_data),
+  Surv(test_data$duration, test_data$event)
+)
+
+# Score dynamics
+fico_dynamics <- test_data %>%
+  mutate(
+    fico_change = `Borrower Credit Score Current ` - `Borrower Credit Score at Origination`
+  ) %>%
+  summarise(
+    correlation = cor(`Borrower Credit Score at Origination`, 
+                     `Borrower Credit Score Current `, use = "complete.obs"),
+    mean_change = mean(fico_change, na.rm = TRUE),
+    median_change = median(fico_change, na.rm = TRUE),
+    sd_change = sd(fico_change, na.rm = TRUE),
+    pct_improved = mean(fico_change > 10, na.rm = TRUE) * 100,
+    pct_stable = mean(abs(fico_change) <= 10, na.rm = TRUE) * 100,
+    pct_declined = mean(fico_change < -10, na.rm = TRUE) * 100
+  )
+
+cat("\n=======================================================\n")
+cat("FICO Score Updates (Origination → October 2025)\n")
+cat("=======================================================\n")
+cat("Correlation:         ", round(fico_dynamics$correlation, 3), "\n")
+cat("Mean change:         ", round(fico_dynamics$mean_change, 1), "points\n")
+cat("Median change:       ", round(fico_dynamics$median_change, 1), "points\n")
+cat("SD of change:        ", round(fico_dynamics$sd_change, 1), "points\n")
+cat("\nBorrower Movement:\n")
+cat("  Improved (>+10):   ", round(fico_dynamics$pct_improved, 1), "%\n")
+cat("  Stable (±10):      ", round(fico_dynamics$pct_stable, 1), "%\n")
+cat("  Declined (<-10):   ", round(fico_dynamics$pct_declined, 1), "%\n")
+cat("\nPredictive Performance:\n")
+cat("  FICO (Origination):", round(fico_orig_cindex["C Index"], 4), "\n")
+cat("  FICO (Current):    ", round(fico_current_cindex["C Index"], 4), "\n")
+cat("  Improvement:       +", 
+    round(fico_current_cindex["C Index"] - fico_orig_cindex["C Index"], 4), "\n")
+cat("  (", round((fico_current_cindex["C Index"] - fico_orig_cindex["C Index"]) / 
+               fico_orig_cindex["C Index"] * 100, 1), "% relative gain)\n")
+cat("=======================================================\n")
+```
+
+**Data Note:** We cannot assess whether updated VS4 scores would provide similar gains, as only origination-time VS4 scores are available in our dataset.
+
+\newpage
+
+# Research Question 2: Treatment of Marginal Borrowers
+
+*To what extent do these scores differ in their treatment of "thin-file" or marginal borrowers?*
+
+## Risk Classification Agreement
+
+Using a 660-score threshold common in mortgage underwriting, we analyze where FICO and VS4 agree and disagree.
+
+```{r rq2_disagreement_analysis}
+# Define risk classifications
+disagreement_data <- test_data %>%
+  mutate(
+    fico_approve = `Borrower Credit Score at Origination` >= 660,
+    vs4_approve = vs4_trimerge >= 660,
+    
+    classification = case_when(
+      fico_approve & vs4_approve ~ "Both Low Risk",
+      !fico_approve & !vs4_approve ~ "Both High Risk",
+      !fico_approve & vs4_approve ~ "FICO High, VS4 Low",
+      fico_approve & !vs4_approve ~ "FICO Low, VS4 High"
+    )
+  )
+
+# Disagreement table
+rq2_table <- disagreement_data %>%
+  group_by(classification) %>%
+  summarise(
+    n_loans = n(),
+    n_events = sum(event),
+    event_rate = mean(event) * 100,
+    pct_portfolio = n() / nrow(test_data) * 100,
+    avg_fico = mean(`Borrower Credit Score at Origination`, na.rm = TRUE),
+    avg_vs4 = mean(vs4_trimerge, na.rm = TRUE)
+  ) %>%
+  arrange(desc(n_loans))
+
+rq2_table %>%
+  gt() %>%
+  fmt_number(columns = c(event_rate, pct_portfolio, avg_fico, avg_vs4), decimals = 2) %>%
+  fmt_number(columns = c(n_loans, n_events), decimals = 0) %>%
+  tab_header(
+    title = "Table 2: FICO vs VantageScore 4.0 Risk Classification Agreement",
+    subtitle = "Risk threshold: Credit score < 660. Baseline event rate: 0.55%"
+  )
+
+print(rq2_table)
+```
+
+```{r rq2_visualization, fig.height=5}
+# Visualize disagreement
+disagreement_viz <- rq2_table %>%
+  mutate(
+    classification = factor(classification, 
+                           levels = c("Both Low Risk", "FICO High, VS4 Low", 
+                                     "FICO Low, VS4 High", "Both High Risk"))
+  )
+
+ggplot(disagreement_viz, aes(x = classification, y = event_rate, fill = classification)) +
+  geom_col() +
+  geom_text(aes(label = sprintf("%.2f%%\n(n=%s)", 
+                                event_rate, 
+                                format(n_loans, big.mark = ","))),
+            vjust = -0.5, size = 3.5, fontface = "bold") +  # Changed vjust to -0.5
+  geom_hline(yintercept = 0.63, linetype = "dashed", color = "red", linewidth = 1) +
+  annotate("text", x = 3, y = 0.75, label = "Baseline: 0.63%", 
+           color = "red", size = 4, fontface = "bold") +  # Moved annotation higher
+  scale_fill_manual(values = c("Both Low Risk" = "darkgreen",
+                               "FICO High, VS4 Low" = "orange",
+                               "FICO Low, VS4 High" = "coral",
+                               "Both High Risk" = "darkred")) +
+  scale_y_continuous(limits = c(0, 3.5), expand = c(0, 0)) +  # Added y-axis limits with padding
+  labs(
+    title = "FICO vs VantageScore 4.0 Disagreement Analysis",
+    subtitle = "Event rates when credit scores disagree on risk classification",
+    x = "",
+    y = "Actual Default Rate (%)",
+    caption = "Risk threshold: Credit score < 660"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "none",
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 10),
+    axis.text.y = element_text(size = 10),
+    plot.title = element_text(size = 14, face = "bold"),
+    plot.subtitle = element_text(size = 11)
+  )
+```
+
+**Key Findings:**
+
+1. **High Agreement (96.6%):** FICO and VS4 agree on `r round(rq2_table %>% filter(classification %in% c("Both Low Risk", "Both High Risk")) %>% pull(pct_portfolio) %>% sum(), 1)`% of the portfolio
+
+2. **VS4 More Accurate in Disagreement Zone:** When scores disagree:
+   - Borrowers approved by VS4 but rejected by FICO: `r round(rq2_table %>% filter(classification == "FICO High, VS4 Low") %>% pull(event_rate), 2)`% default rate
+   - Borrowers approved by FICO but rejected by VS4: `r round(rq2_table %>% filter(classification == "FICO Low, VS4 High") %>% pull(event_rate), 2)`% default rate
+   
+3. **Credit Access Opportunity:** VS4 identifies `r format(rq2_table %>% filter(classification == "FICO High, VS4 Low") %>% pull(n_loans), big.mark = ",")` borrowers (1.9% of portfolio) who could access credit despite FICO < 660, with elevated but manageable risk
+
+\newpage
+
+# Research Question 3: Enhanced Model Performance
+
+*Can an enhanced credit model, built on a richer set of features, deliver meaningful improvements in predictive power relative to FICO and VS4?*
+
+## Progressive Model Development
+
+We build models of increasing complexity to quantify incremental value.
+
+```{r rq3_progressive_models}
+# Define feature sets
+origination_features <- c(
+  "`Borrower Credit Score at Origination`",
+  "vs4_trimerge",
+  "`Original Loan to Value Ratio (LTV)`",
+  "`Debt-To-Income (DTI)`",
+  "`Original Interest Rate`",
+  "is_cashout_refi",
+  "is_investor",
+  "is_arm"
+)
+
+# Exclude from full model
+exclude_vars <- c(
+  "Loan Identifier",
+  "Reference Pool ID",
+  "Zip Code Short",
+  "duration",
+  "event",
+  "Loan Purpose",
+  "Property Type",
+  "Occupancy Status",
+  "Amortization Type",
+  "Modification Flag",
+  "Interest Only Loan Indicator",
+  "Borrower Credit Score Current"
+)
+
+all_features <- setdiff(names(train_data), exclude_vars)
+
+# Model A: FICO only
+model_a <- coxph(
+  Surv(duration, event) ~ `Borrower Credit Score at Origination`,
+  data = train_data
+)
+
+# Model B: FICO + VS4
+model_b <- both_scores_model  # Already defined
+
+# Model C: Origination features
+formula_c <- as.formula(
+  paste("Surv(duration, event) ~", paste(origination_features, collapse = " + "))
+)
+model_c <- coxph(formula_c, data = train_data)
+
+# Model D: All features (Cox only)
+formula_d <- as.formula(
+  paste("Surv(duration, event) ~", 
+        paste(paste0("`", all_features, "`"), collapse = " + "))
+)
+model_d <- coxph(formula_d, data = train_data, model = TRUE)
+
+# Evaluate all models
+cindex_a <- rcorr.cens(-predict(model_a, test_data), 
+                       Surv(test_data$duration, test_data$event))["C Index"]
+cindex_b <- rcorr.cens(-predict(model_b, test_data), 
+                       Surv(test_data$duration, test_data$event))["C Index"]
+cindex_c <- rcorr.cens(-predict(model_c, test_data), 
+                       Surv(test_data$duration, test_data$event))["C Index"]
+cindex_d <- rcorr.cens(-predict(model_d, test_data), 
+                       Surv(test_data$duration, test_data$event))["C Index"]
+
+# Progressive comparison table
+progressive_table <- tibble(
+  Model = c("A: FICO Only", "B: FICO + VS4", "C: + Loan Characteristics", 
+            "D: + Behavioral Features"),
+  `Information Set` = c("Single score", "Credit scores", "Origination data", "Point-in-time"),
+  `N Features` = c(1, 2, length(origination_features), length(all_features)),
+  `C-Index` = c(cindex_a, cindex_b, cindex_c, cindex_d)
+) %>%
+  mutate(
+    `Incremental Gain` = `C-Index` - lag(`C-Index`),
+    `Cumulative Improvement (%)` = (`C-Index` - first(`C-Index`)) / first(`C-Index`) * 100
+  )
+
+progressive_table %>%
+  gt() %>%
+  fmt_number(columns = c(`C-Index`, `Incremental Gain`), decimals = 4) %>%
+  fmt_number(columns = `Cumulative Improvement (%)`, decimals = 1) %>%
+  fmt_missing(columns = everything(), missing_text = "-") %>%
+  tab_header(
+    title = "Table 3: Progressive Model Enhancement",
+    subtitle = "Incremental value of additional feature sets"
+  ) %>%
+  tab_style(
+    style = cell_fill(color = "lightgreen"),
+    locations = cells_body(
+      columns = `C-Index`,
+      rows = `C-Index` == max(`C-Index`)
+    )
+  )
+
+print(progressive_table)
+```
+
+## Hybrid Model: Cox + XGBoost
+
+We enhance the Cox baseline with XGBoost to capture non-linear patterns.
+
+```{r rq3_hybrid_model}
+# Calculate Cox residuals
+train_data$cox_deviance <- residuals(model_d, type = "deviance")
+
+# Clean data
+train_clean <- train_data %>%
+  filter(is.finite(cox_deviance)) %>%
+  filter(!is.na(cox_deviance))
+
+# XGBoost on residuals
+dtrain <- xgb.DMatrix(
+  data = as.matrix(train_clean[, all_features]),
+  label = train_clean$cox_deviance
+)
+
+dtest <- xgb.DMatrix(
+  data = as.matrix(test_data[, all_features])
+)
+
+# XGBoost parameters
+xgb_params <- list(
+  objective = "reg:squarederror",
+  eta = 0.05,
+  max_depth = 6,
+  subsample = 0.8,
+  colsample_bytree = 0.8,
+  min_child_weight = 5,
+  gamma = 0.1
+)
+
+
+# set.seed(123)
+# cv_result <- xgb.cv(
+#   params = xgb_params,
+#   data = dtrain,
+#   nrounds = 200,
+#   nfold = 5,
+#   early_stopping_rounds = 10,
+#   verbose = 0
+# )
+# 
+# optimal_rounds <- cv_result$best_iteration
+
+# Train final model
+xgb_model <- xgboost(
+  params = xgb_params,
+  data = dtrain,
+  nrounds = 200,
+  verbose = 0
+)
+
+# Predictions
+test_data$cox_lp <- predict(model_d, newdata = test_data, type = "lp")
+test_data$xgb_residual_pred <- predict(xgb_model, dtest)
+test_data$hybrid_risk_score <- test_data$cox_lp + test_data$xgb_residual_pred
+
+# Evaluate hybrid
+hybrid_cindex_val <- rcorr.cens(
+  -test_data$hybrid_risk_score,
+  Surv(test_data$duration, test_data$event)
+)
+
+hybrid_cindex <- list(
+  c.index = as.numeric(hybrid_cindex_val["C Index"]),
+  se = as.numeric(hybrid_cindex_val["S.D."]/2)
+)
+
+cat("\n=======================================================\n")
+cat("HYBRID MODEL PERFORMANCE\n")
+cat("=======================================================\n")
+cat("Cox Baseline (Model D):  C-index =", round(cindex_d, 4), "\n")
+cat("Hybrid (Cox + XGBoost):  C-index =", round(hybrid_cindex$c.index, 4), "\n")
+cat("Improvement:             +", round(hybrid_cindex$c.index - cindex_d, 4), "\n")
+cat("=======================================================\n")
+```
+
+## Risk Stratification
+
+```{r rq3_risk_stratification}
+# Create risk groups
+test_data <- test_data %>%
+  mutate(
+    hybrid_risk_group = cut(
+      hybrid_risk_score,
+      breaks = quantile(hybrid_risk_score, probs = 0:4/4),
+      labels = c("Low", "Medium-Low", "Medium-High", "High"),
+      include.lowest = TRUE
+    )
+  )
+
+# Risk group analysis
+risk_table <- test_data %>%
+  group_by(hybrid_risk_group) %>%
+  summarise(
+    n_loans = n(),
+    n_events = sum(event),
+    event_rate = mean(event) * 100
+  ) %>%
+  mutate(
+    relative_risk = event_rate / 0.55
+  )
+
+risk_table %>%
+  gt() %>%
+  fmt_number(columns = c(event_rate, relative_risk), decimals = 2) %>%
+  fmt_number(columns = c(n_loans, n_events), decimals = 0) %>%
+  tab_header(
+    title = "Table 4: Risk Stratification Performance",
+    subtitle = "Baseline event rate: 0.55%"
+  )
+
+print(risk_table)
+```
+
+```{r rq3_risk_viz, fig.height=5}
+# Visualize risk separation
+ggplot(risk_table, aes(x = hybrid_risk_group, y = event_rate, fill = hybrid_risk_group)) +
+  geom_col() +
+  geom_text(aes(label = paste0(round(event_rate, 2), "%")), vjust = -0.5) +
+  scale_fill_manual(values = c("green", "yellow", "orange", "red")) +
+  geom_hline(yintercept = 0.64, linetype = "dashed", color = "gray50") +
+  labs(
+    title = "Figure 2: Event Rates by Hybrid Model Risk Group",
+    x = "Risk Group",
+    y = "Event Rate (%)",
+    caption = "Dashed line: Portfolio baseline (0.63%)"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+**Key Finding:** The enhanced model achieves `r round((hybrid_cindex$c.index - cindex_a) / cindex_a * 100, 1)`% improvement over FICO alone, with clear monotonic risk separation (`r round(risk_table$event_rate[4] / risk_table$event_rate[1], 1)`x high/low ratio).
+
+\newpage
+
+# Research Question 4: Implications for Credit Risk Management
+
+*What are the implications of such improvements for credit risk management and financial inclusion?*
+
+## Strategic Portfolio Rebalancing
+
+We compare the hybrid model against FICO at equivalent approval rates to assess reallocation decisions.
+
+```{r rq4_rebalancing_setup}
+# Set FICO threshold
+fico_threshold <- 660
+fico_approval_rate <- mean(test_data$`Borrower Credit Score at Origination` >= fico_threshold)
+
+# Find equivalent model threshold
+model_threshold <- quantile(test_data$hybrid_risk_score, probs = fico_approval_rate)
+
+cat("FICO approval rate at 660 threshold:", round(fico_approval_rate * 100, 2), "%\n")
+cat("Model threshold for same approval rate:", round(model_threshold, 2), "\n")
+```
+
+```{r rq4_reclassification}
+# Three-way classification
+reclass_data <- test_data %>%
+  mutate(
+    fico_approve = `Borrower Credit Score at Origination` >= fico_threshold,
+    vs4_approve = vs4_trimerge >= 660,
+    model_approve = hybrid_risk_score <= model_threshold,
+    
+    category = case_when(
+      fico_approve & vs4_approve & model_approve ~ "All Approve",
+      !fico_approve & !vs4_approve & model_approve ~ "Scores Reject, Model Approves",
+      (fico_approve | vs4_approve) & !model_approve ~ "Scores Approve, Model Rejects",
+      !fico_approve & !vs4_approve & !model_approve ~ "All Reject",
+      TRUE ~ "Mixed"
+    )
+  )
+
+# Detailed reclassification
+reclass_table <- reclass_data %>%
+  group_by(category) %>%
+  summarise(
+    n_loans = n(),
+    n_events = sum(event),
+    event_rate = mean(event) * 100,
+    pct_portfolio = n() / nrow(test_data) * 100,
+    avg_fico = mean(`Borrower Credit Score at Origination`, na.rm = TRUE),
+    avg_vs4 = mean(vs4_trimerge, na.rm = TRUE)
+  ) %>%
+  arrange(desc(n_loans))
+
+reclass_table %>%
+  gt() %>%
+  fmt_number(columns = c(event_rate, pct_portfolio, avg_fico, avg_vs4), decimals = 2) %>%
+  fmt_number(columns = c(n_loans, n_events), decimals = 0) %>%
+  tab_header(
+    title = "Table 5: Three-Way Reclassification Analysis",
+    subtitle = "FICO, VantageScore 4.0, and Enhanced Model decisions"
+  )
+
+print(reclass_table)
+```
+
+## Net Impact Analysis
+
+```{r rq4_net_impact}
+# Calculate expansion and mitigation
+expansion_group <- reclass_data %>%
+  filter(category == "Scores Reject, Model Approves")
+
+mitigation_group <- reclass_data %>%
+  filter(category == "Scores Approve, Model Rejects")
+
+expansion_defaults <- nrow(expansion_group) * mean(expansion_group$event)
+mitigation_avoided <- nrow(mitigation_group) * mean(mitigation_group$event)
+
+# Summary table
+impact_table <- tibble(
+  `Model Decision` = c("Risk Mitigation", "Credit Expansion", "Net Portfolio Impact"),
+  `Loan Count` = c(
+    paste0("-", format(nrow(mitigation_group), big.mark = ",")),
+    paste0("+", format(nrow(expansion_group), big.mark = ",")),
+    format(nrow(expansion_group) - nrow(mitigation_group), big.mark = ",")
+  ),
+  `Default Count` = c(
+    paste0("-", round(mitigation_avoided, 0)),
+    paste0("+", round(expansion_defaults, 0)),
+    paste0("+", round(expansion_defaults - mitigation_avoided, 0))
+  ),
+  `Avg FICO` = c(
+    round(mean(mitigation_group$`Borrower Credit Score at Origination`, na.rm = TRUE), 0),
+    round(mean(expansion_group$`Borrower Credit Score at Origination`, na.rm = TRUE), 0),
+    "-"
+  ),
+  `Default Rate` = c(
+    paste0(round(mean(mitigation_group$event) * 100, 2), "%"),
+    paste0(round(mean(expansion_group$event) * 100, 2), "%"),
+    "-"
+  ),
+  `Interpretation` = c(
+    "Catches high-risk loans traditional scores miss",
+    "Extends credit to creditworthy thin-file borrowers",
+    "Net conservative stance with targeted expansion"
+  )
+)
+
+impact_table %>%
+  gt() %>%
+  tab_header(
+    title = "Table 6: Enhanced Model Portfolio Impact vs FICO-Based Underwriting",
+    subtitle = "Strategic rebalancing of credit access and risk management"
+  ) %>%
+  tab_style(
+    style = cell_fill(color = "lightcoral"),
+    locations = cells_body(
+      rows = `Model Decision` == "Risk Mitigation"
+    )
+  ) %>%
+  tab_style(
+    style = cell_fill(color = "lightgreen"),
+    locations = cells_body(
+      rows = `Model Decision` == "Credit Expansion"
+    )
+  ) %>%
+  tab_style(
+    style = cell_fill(color = "lightblue"),
+    locations = cells_body(
+      rows = `Model Decision` == "Net Portfolio Impact"
+    )
+  )
+
+print(impact_table)
+
+cat("\n=======================================================\n")
+cat("NET IMPACT ANALYSIS\n")
+cat("=======================================================\n")
+cat("Credit Expansion:\n")
+cat("  +", format(nrow(expansion_group), big.mark = ","), "approvals\n")
+cat("  +", round(expansion_defaults, 0), "additional defaults\n")
+cat("\n")
+cat("Risk Mitigation:\n")
+cat("  -", format(nrow(mitigation_group), big.mark = ","), "approvals\n")
+cat("  -", round(mitigation_avoided, 0), "defaults avoided\n")
+cat("\n")
+cat("NET EFFECT:\n")
+cat("  Net loans:    ", format(nrow(expansion_group) - nrow(mitigation_group), big.mark = ","), "\n")
+cat("  Net defaults: ", round(expansion_defaults - mitigation_avoided, 0), "\n")
+cat("\n")
+cat("APPROVAL-TO-DEFAULT RATIO:\n")
+cat("  ", round(nrow(expansion_group) / (expansion_defaults - mitigation_avoided), 0), 
+    ":1 (approvals per incremental default)\n")
+cat("=======================================================\n")
+```
+
+```{r rq4_visualization, fig.height=6}
+# Impact waterfall
+impact_viz <- tibble(
+  Category = factor(c(
+    "FICO Baseline",
+    "Risk Mitigation\n(-5,156 loans)",
+    "Credit Expansion\n(+1,264 loans)",
+    "Net Portfolio"
+  ), levels = c(
+    "FICO Baseline",
+    "Risk Mitigation\n(-5,156 loans)",
+    "Credit Expansion\n(+1,264 loans)",
+    "Net Portfolio"
+  )),
+  Defaults = c(
+    100,
+    100 - mitigation_avoided,
+    100 - mitigation_avoided + expansion_defaults,
+    100 + (expansion_defaults - mitigation_avoided)
+  ),
+  Change = c(0, -mitigation_avoided, expansion_defaults, 0),
+  Type = c("baseline", "decrease", "increase", "result")
+)
+
+ggplot(impact_viz, aes(x = Category, y = Defaults, fill = Type)) +
+  geom_col() +
+  geom_text(aes(label = ifelse(Change != 0,
+                                sprintf("%+.0f", Change),
+                                sprintf("%.0f", Defaults))),
+            vjust = ifelse(impact_viz$Change >= 0, -0.5, 1.5),
+            size = 4) +
+  scale_fill_manual(values = c(
+    "baseline" = "gray70",
+    "decrease" = "darkgreen",
+    "increase" = "coral",
+    "result" = "steelblue"
+  )) +
+  geom_hline(yintercept = 100, linetype = "dashed", color = "red", alpha = 0.5) +
+  labs(
+    title = "Figure 3: Portfolio Impact - Enhanced Model vs FICO",
+    subtitle = sprintf("Net +%.0f defaults for +%s borrowers approved", 
+                      expansion_defaults - mitigation_avoided,
+                      format(nrow(expansion_group), big.mark = ",")),
+    x = "",
+    y = "Expected Defaults (FICO Baseline = 100)",
+    caption = "Risk Mitigation avoids defaults | Credit Expansion adds defaults"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+**Key Findings:**
+
+1. **Credit Expansion:** `r format(nrow(expansion_group), big.mark = ",")` borrowers (average FICO `r round(mean(expansion_group$"Borrower Credit Score at Origination", na.rm = TRUE), 0)`) gain access despite both scores rejecting them
+
+2. **Risk Mitigation:** `r format(nrow(mitigation_group), big.mark = ",")` high-risk loans flagged that traditional scores would approve
+
+3. **Net Conservative:** Despite expansion, model approves `r format(nrow(mitigation_group) - nrow(expansion_group), big.mark = ",")` fewer loans overall
+
+4. **Favorable Trade-off:** `r round(nrow(expansion_group) / max(1, expansion_defaults - mitigation_avoided), 0)`:1 ratio of approvals to incremental defaults
+
+\newpage
+
+# Summary and Conclusions
+
+## Key Findings by Research Question
+
+### RQ1: FICO vs VantageScore 4.0
+- VS4 provides marginal improvement over FICO (ΔC-index = +0.006)
+- Combined scores achieve C-index 0.746, indicating complementary but overlapping information
+- Current FICO scores show `r round((fico_current_cindex["C Index"] - fico_orig_cindex["C Index"]) / fico_orig_cindex["C Index"] * 100, 1)`% improvement over origination scores
+
+### RQ2: Treatment of Marginal Borrowers
+- 96.6% agreement in risk classification between FICO and VS4
+- In disagreement zones, VS4 demonstrates superior accuracy (1.82% vs 2.55% default rates)
+- VS4 identifies 4,236 creditworthy borrowers (1.9% of portfolio) that FICO would reject
+
+### RQ3: Enhanced Model Performance  
+- Progressive enhancement shows: FICO alone (0.732) → +Loan chars (0.850) → +Behavioral (0.996) → +XGBoost (0.997)
+- Most gains from behavioral features (+14.5pp), not score choice (+0.6pp) or ML techniques (+0.1pp)
+- Clear risk stratification: 2.8x separation between high and low-risk quartiles
+
+### RQ4: Credit Risk Management Implications
+- Strategic portfolio rebalancing: +1,264 approvals, -5,156 rejections, net +3 defaults
+- 421:1 approval-to-default ratio demonstrates favorable risk-return trade-off
+- Enhanced models enable dual objectives: financial inclusion + risk management
+
+## Methodological Contributions
+
+1. **Fair Comparison Framework:** Progressive analysis isolates score methodology, score updates, and feature richness
+2. **Point-in-Time vs Origination:** Clear distinction between underwriting and portfolio monitoring use cases
+3. **Reclassification Analysis:** Quantifies both credit expansion and risk mitigation impacts
+
+## Limitations
+
+- Cross-sectional data (October 2025 snapshot) rather than longitudinal panel
+- VS4 scores only available at origination (cannot assess value of updates)
+- Low event rate (0.55%) limits absolute capture rates despite high C-index
+- Prime mortgage focus may not generalize to subprime or other credit products
+
+## Policy Implications
+
+The enhanced model's strategic rebalancing—expanding access to 1,264 thin-file borrowers while maintaining net conservative stance—demonstrates that richer feature sets can achieve dual objectives of financial inclusion and prudent risk management. The 421:1 approval-to-default ratio suggests safe credit expansion is achievable through behavioral modeling.
+
+---
+
+# Technical Appendix
+
+## Feature Importance
+
+```{r appendix_feature_importance, fig.height=8}
+# Cox coefficients
+cox_coefs <- broom::tidy(model_d) %>%
+  mutate(abs_estimate = abs(estimate)) %>%
+  arrange(desc(abs_estimate)) %>%
+  slice_head(n = 20)
+
+ggplot(cox_coefs, aes(x = reorder(term, abs_estimate), y = estimate,
+                      fill = estimate > 0)) +
+  geom_col() +
+  coord_flip() +
+  scale_fill_manual(values = c("steelblue", "coral"),
+                    labels = c("Decreases Risk", "Increases Risk")) +
+  labs(
+    title = "Figure A1: Cox Model Feature Importance",
+    subtitle = "Top 20 features by coefficient magnitude",
+    x = "",
+    y = "Log Hazard Ratio",
+    fill = ""
+  ) +
+  theme_minimal()
+
+# XGBoost importance
+xgb_importance <- xgb.importance(feature_names = all_features, model = xgb_model) %>%
+  as_tibble() %>%
+  slice_head(n = 20)
+
+ggplot(xgb_importance, aes(x = reorder(Feature, Gain), y = Gain)) +
+  geom_col(fill = "coral") +
+  coord_flip() +
+  labs(
+    title = "Figure A2: XGBoost Feature Importance",
+    subtitle = "Top 20 features by Gain metric",
+    x = "",
+    y = "Relative Importance"
+  ) +
+  theme_minimal()
+```
+
+## Model Diagnostics
+
+```{r appendix_diagnostics}
+cat("\n=======================================================\n")
+cat("MODEL DIAGNOSTICS\n")
+cat("=======================================================\n")
+cat("Training Set:\n")
+cat("  Samples:", nrow(train_data), "\n")
+cat("  Events:", sum(train_data$event), "\n")
+cat("  Event rate:", round(mean(train_data$event) * 100, 2), "%\n")
+cat("\nTest Set:\n")
+cat("  Samples:", nrow(test_data), "\n")
+cat("  Events:", sum(test_data$event), "\n")
+cat("  Event rate:", round(mean(test_data$event) * 100, 2), "%\n")
+cat("\nXGBoost Training:\n")
+cat("  Optimal rounds:", 200, "\n")
+cat("  Final RMSE:", round(tail(xgb_model$evaluation_log$train_rmse, 1), 4), "\n")
+cat("=======================================================\n")
+```
